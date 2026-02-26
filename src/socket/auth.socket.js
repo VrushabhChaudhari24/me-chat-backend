@@ -5,7 +5,7 @@ const socketAuth = (socket, next) => {
     const token = socket.handshake.auth?.token;
 
     if (!token) {
-      return next(new Error("Authentication error"));
+      return next(new Error("Authentication error No Token"));
     }
 
     const decoded = jwt.verify(token, process.env.JWT_SECRET);

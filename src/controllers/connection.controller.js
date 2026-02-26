@@ -1,7 +1,10 @@
+import mongoose from "mongoose";
 import Chat from "../models/Chat.js";
 import ConnectionRequest from "../models/ConnectionRequest.js";
 import { getSocketIdsByUserId } from "../socket/onlineUsers.js";
 import findOrCreateChat from "../utils/findOrCreateChat.js";
+import hasMutualFollow from "../utils/mutualFollow.js";
+import User from "../models/User.js";
 
 /**
  * SEND CONNECTION REQUEST
@@ -28,17 +31,17 @@ export const sendConnectionRequest = async (req, res) => {
       return res.status(400).json({ message: "Request already sent" });
     }
 
-    const reverse = await ConnectionRequest.findOne({
-      sender: receiverId,
-      receiver: senderId,
-      status: "pending",
-    }).lean();
+    // const reverse = await ConnectionRequest.findOne({
+    //   sender: receiverId,
+    //   receiver: senderId,
+    //   status: "pending",
+    // }).lean();
 
-    if (reverse) {
-      return res.status(400).json({
-        message: "User has already sent you a request",
-      });
-    }
+    // if (reverse) {
+    //   return res.status(400).json({
+    //     message: "User has already sent you a request",
+    //   });
+    // }
 
     const request = await ConnectionRequest.create({
       sender: senderId,
@@ -112,7 +115,7 @@ export const acceptConnectionRequest = async (req, res) => {
     );
 
     res.json({
-      message: "Connection request accepted"
+      message: "Connection request accepted",
     });
   } catch (error) {
     console.error(error);
@@ -120,6 +123,102 @@ export const acceptConnectionRequest = async (req, res) => {
       message: "Failed to accept request",
     });
   }
+};
+
+export const acceptAndChatConnectionRequest = async (req, res) => {
+  const session = await mongoose.startSession();
+  try {
+    const userId = req.userId;
+    const { requestId } = req.params;
+    const io = req.app.get("io");
+
+    const request = await ConnectionRequest.findById(requestId);
+
+    if (!request) {
+      return res.status(404).json({
+        message: "Connection request not found",
+      });
+    }
+
+    if (request.receiver.toString() !== userId) {
+      return res.status(403).json({
+        message: "Not authorized to accept this request",
+      });
+    }
+
+    if (request.status !== "pending") {
+      return res.status(400).json({
+        message: "Request already processed",
+      });
+    }
+
+    if (request.receiver.toString() !== userId) {
+      return res.status(403).json({ message: "Unauthorized" });
+    }
+
+    request.status = "accepted";
+    await request.save();
+
+    const senderId = request.sender.toString();
+    const receiverId = request.receiver.toString();
+
+    // 🔥 Notify sender
+    getSocketIdsByUserId(senderId).forEach((id) =>
+      io.to(id).emit("connection:accepted", {
+        userId: receiverId,
+      })
+    );
+
+    session.startTransaction();
+
+    // add follow relationship and following
+
+    await User.findByIdAndUpdate(
+      senderId,
+      { $addToSet: { following: receiverId } },
+      { session }
+    );
+
+    await User.findByIdAndUpdate(
+      receiverId,
+      { $addToSet: { followers: senderId } },
+      { session }
+    );
+
+    await session.commitTransaction();
+
+    //check for both users are mutual connection chat or not
+    const allowed = await hasMutualFollow(senderId, receiverId);
+
+    console.log(allowed);
+
+    if (!allowed) {
+      return res.status(200).json({
+        message: "Connection request accepted",
+      });
+    }
+    // Check existing chat
+    let chat = await Chat.findOne({
+      participants: { $all: [senderId, receiverId] },
+    });
+
+    let newChat
+    if (!chat) {
+      newChat = await findOrCreateChat(senderId, receiverId)
+    }
+    res.status(200).json({
+      message: "Connection request accepted and new chat created",
+      data: newChat,
+    });
+  } catch (error) {
+    console.error(error);
+    await session.abortTransaction();
+    res.status(500).json({
+      message: "Failed to accept request",
+    });
+  }finally {
+  session.endSession();
+}
 };
 
 /**
@@ -181,6 +280,7 @@ export const getSentRequests = async (req, res) => {
 
     const requests = await ConnectionRequest.find({
       sender: userId,
+      status: "pending",
     })
       .populate("receiver", "name mobile")
       .sort({ createdAt: -1 });
@@ -227,15 +327,17 @@ export const getMutualConnections = async (req, res) => {
     const connections = await ConnectionRequest.find({
       status: "accepted",
       $or: [{ sender: userId }, { receiver: userId }],
-    }).populate("sender receiver", "name mobile").lean();
-    
+    })
+      .populate("sender receiver", "name mobile")
+      .lean();
+
     // Users I follow
     const following = new Map();
 
     // Users who follow me
     const followers = new Map();
 
-    connections.forEach(conn => {
+    connections.forEach((conn) => {
       const senderId = conn.sender._id.toString();
       const receiverId = conn.receiver._id.toString();
 
@@ -248,7 +350,6 @@ export const getMutualConnections = async (req, res) => {
       }
     });
 
-    
     // Mutual connections
     const mutualConnections = [];
 
@@ -256,25 +357,78 @@ export const getMutualConnections = async (req, res) => {
       if (followers.has(id)) {
         mutualConnections.push({
           ...user,
-          isMutual: true
+          isMutual: true,
         });
       }
     });
 
     const chats = await Chat.find({
-          participants: userId,
-        })
+      participants: userId,
+    });
     const filteredMutualConnections = mutualConnections.filter((mutual) => {
-  return !chats.some((chat) => {
-    return (
-      chat.participants.includes(userId) &&
-      chat.participants.includes(mutual._id)
-    );
-  });
-});
+      return !chats.some((chat) => {
+        return (
+          chat.participants.includes(userId) &&
+          chat.participants.includes(mutual._id)
+        );
+      });
+    });
 
     res.json(filteredMutualConnections);
+  } catch (error) {
+    res.status(500).json({
+      message: "Failed to fetch connections",
+    });
+  }
+};
 
+export const getConnection = async (req, res) => {
+  try {
+    const userId = new mongoose.Types.ObjectId(req.userId);
+
+    const requests = await ConnectionRequest.aggregate([
+      {
+        $match: {
+          status: "pending",
+          $or: [{ sender: userId }, { receiver: userId }],
+        },
+      },
+      { $sort: { createdAt: -1 } },
+      {
+        $lookup: {
+          from: "users",
+          localField: "sender",
+          foreignField: "_id",
+          as: "sender",
+        },
+      },
+      {
+        $lookup: {
+          from: "users",
+          localField: "receiver",
+          foreignField: "_id",
+          as: "receiver",
+        },
+      },
+      { $unwind: "$sender" },
+      { $unwind: "$receiver" },
+      {
+        $project: {
+          status: 1,
+          createdAt: 1,
+          type: {
+            $cond: [{ $eq: ["$sender._id", userId] }, "sent", "received"],
+          },
+          sender: { _id: 1, name: 1, mobile: 1 },
+          receiver: { _id: 1, name: 1, mobile: 1 },
+        },
+      },
+    ]);
+
+    res.json({
+      sentRequests: requests.filter((r) => r.type === "sent"),
+      receivedRequests: requests.filter((r) => r.type === "received"),
+    });
   } catch (error) {
     res.status(500).json({
       message: "Failed to fetch connections",

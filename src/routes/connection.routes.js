@@ -7,6 +7,8 @@ import {
   getSentRequests,
   getReceivedRequests,
   getMutualConnections,
+  getConnection,
+  acceptAndChatConnectionRequest,
 } from "../controllers/connection.controller.js";
 
 const router = express.Router();
@@ -18,5 +20,9 @@ router.post("/reject/:requestId", authMiddleware, rejectConnectionRequest);
 router.get("/sent", authMiddleware, getSentRequests);
 router.get("/received", authMiddleware, getReceivedRequests);
 router.get("/mutual", authMiddleware, getMutualConnections);
+
+//V2
+router.get("/connection", authMiddleware, getConnection);
+router.post("/accept-chat/:requestId", authMiddleware, acceptAndChatConnectionRequest);
 
 export default router;
